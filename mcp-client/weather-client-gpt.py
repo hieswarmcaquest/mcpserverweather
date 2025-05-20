@@ -1,54 +1,45 @@
-import sys
 import asyncio
 import json
-from typing import Optional
+import threading
+import queue
+import os
+import sys
 from contextlib import AsyncExitStack
+import tkinter as tk
+from tkinter import scrolledtext, filedialog, messagebox
 
+import openai
+from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-import os
-import openai
-from dotenv import load_dotenv
-
-load_dotenv()  # Load OPENAI_API_KEY from .env
+load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class MCPClient:
     def __init__(self):
-        self.session: Optional[ClientSession] = None
+        self.session = None
         self.exit_stack = AsyncExitStack()
 
-    async def connect_to_server(self, server_script_path: str):
-        is_py = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
+    async def connect(self, script_path: str):
+        is_py = script_path.endswith('.py')
+        is_js = script_path.endswith('.js')
         if not (is_py or is_js):
-            raise ValueError("Server script must be .py or .js")
-
+            raise ValueError("Server script must be .py or .js file")
         cmd = "python" if is_py else "node"
-        params = StdioServerParameters(command=cmd, args=[server_script_path], env=None)
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(params))
-        self.stdio, self.write = stdio_transport
+        params = StdioServerParameters(command=cmd, args=[script_path], env=None)
+        transport = await self.exit_stack.enter_async_context(stdio_client(params))
+        self.stdio, self.write = transport
         self.session = await self.exit_stack.enter_async_context(
             ClientSession(self.stdio, self.write)
         )
         await self.session.initialize()
 
+    async def process(self, query: str) -> str:
         resp = await self.session.list_tools()
-        print("Connected to server with tools:", [t.name for t in resp.tools])
-
-    async def process_query(self, query: str) -> str:
-        # Fetch tool definitions
-        resp = await self.session.list_tools()
-        functions = [
-            {"name": t.name, "description": t.description, "parameters": t.inputSchema}
-            for t in resp.tools
-        ]
-
-        # Initial user message
+        functions = [{"name": t.name, "description": t.description, "parameters": t.inputSchema}
+                     for t in resp.tools]
         messages = [{"role": "user", "content": query}]
-
-        # Ask GPT
         completion = await openai.ChatCompletion.acreate(
             model="gpt-4o-mini",
             messages=messages,
@@ -57,78 +48,100 @@ class MCPClient:
             max_tokens=1000
         )
         msg = completion.choices[0].message
-
         if msg.get("function_call"):
-            # Execute the requested tool
             fn = msg.function_call.name
             args = json.loads(msg.function_call.arguments or "{}")
             tool_resp = await self.session.call_tool(fn, args)
-
-            # Debugging Content Type
-            print("Debug - Content Type:", type(tool_resp.content))
-            print("Debug - Content Type index:", type(tool_resp.content[0]))
-            print("Debug - Content:", tool_resp.content)
-
-            # Extract text from TextContent objects within lists
-            content = tool_resp.content
-            if isinstance(content, list):
-                content = [item.text if hasattr(item, "text") else str(item) for item in content]
-            elif isinstance(content, dict):
-                raw = json.dumps(content)
-            else:
-                raw = json.dumps({"response": str(content)})
-
-            raw = json.dumps(content)  # Ensure final content is JSON serializable
-
-            # Append the assistant’s function_call as a pure dict
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "function_call": {
-                    "name": fn,
-                    "arguments": msg.function_call.arguments,
-                }
-            })
-
-            # Append the function’s response
-            messages.append({"role": "function", "name": fn, "content": raw})
-
-            # Get GPT’s final answer
+            messages.append({"role": "assistant", "content": None, "function_call": {"name": fn, "arguments": msg.function_call.arguments}})
+            messages.append({"role": "function", "name": fn, "content": tool_resp.content})
             followup = await openai.ChatCompletion.acreate(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=1000
+                model="gpt-4o-mini", messages=messages, max_tokens=1000
             )
             return followup.choices[0].message.content or ""
-
-        # No function call: just return the assistant’s reply
         return msg.content or ""
 
-    async def chat_loop(self):
-        print("MCP GPT-Client started. Type ‘quit’ to exit.")
-        while True:
-            q = input("Query: ").strip()
-            if q.lower() == "quit":
-                break
-            try:
-                print(await self.process_query(q))
-            except Exception as e:
-                print("Error:", e)
+class GUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("MCP Weather GPT Client")
+        self.frame = tk.Frame(root)
+        self.frame.pack(fill=tk.BOTH, expand=True)
 
-    async def cleanup(self):
-        await self.exit_stack.aclose()
+        self.chat = scrolledtext.ScrolledText(self.frame, state='disabled', wrap=tk.WORD)
+        self.chat.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
 
-async def main():
-    if len(sys.argv) < 2:
-        print("Usage: python weather-client-gpt.py <path_to_server_script>")
-        sys.exit(1)
-    c = MCPClient()
-    try:
-        await c.connect_to_server(sys.argv[1])
-        await c.chat_loop()
-    finally:
-        await c.cleanup()
+        self.input_frame = tk.Frame(self.frame)
+        self.input_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.entry = tk.Entry(self.input_frame)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry.bind('<Return>', lambda e: self.send_query())
+        self.send_btn = tk.Button(self.input_frame, text="Send", command=self.send_query)
+        self.send_btn.pack(side=tk.RIGHT)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        self.menu = tk.Menu(root)
+        root.config(menu=self.menu)
+        file_menu = tk.Menu(self.menu, tearoff=0)
+        self.menu.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Connect to Server…", command=self.choose_and_connect)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=root.quit)
 
+        self.query_q = queue.Queue()
+        self.response_q = queue.Queue()
+        self.client = MCPClient()
+        self.connected = False
+        self.root.after(100, self.check_responses)
+
+    def log(self, msg: str):
+        self.chat.configure(state='normal')
+        self.chat.insert(tk.END, msg + '
+')
+        self.chat.configure(state='disabled')
+        self.chat.yview(tk.END)
+
+    def choose_and_connect(self):
+        path = filedialog.askopenfilename(title="Select server script (.py/.js)", filetypes=[("Python/JS files","*.py *.js")])
+        if not path:
+            return
+        self.log(f"Connecting to server: {path} ...")
+        threading.Thread(target=self.start_async_loop, args=(path,), daemon=True).start()
+
+    def start_async_loop(self, script_path):
+        asyncio.run(self.async_main(script_path))
+
+    async def async_main(self, script_path):
+        try:
+            await self.client.connect(script_path)
+            self.connected = True
+            self.log("✅ Connected to MCP server.")
+            while True:
+                query = await asyncio.get_event_loop().run_in_executor(None, self.query_q.get)
+                self.log(f"You: {query}")
+                try:
+                    resp = await self.client.process(query)
+                    self.response_q.put(resp)
+                except Exception as e:
+                    self.response_q.put(f"Error: {e}")
+        except Exception as e:
+            self.log(f"Connection failed: {e}")
+
+    def send_query(self):
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Please connect to a server first.")
+            return
+        q = self.entry.get().strip()
+        if not q:
+            return
+        self.entry.delete(0, tk.END)
+        self.query_q.put(q)
+
+    def check_responses(self):
+        while not self.response_q.empty():
+            resp = self.response_q.get()
+            self.log(f"GPT: {resp}")
+        self.root.after(100, self.check_responses)
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    GUI(root)
+    root.mainloop()
